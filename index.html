@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>QRグリッド受信 (CDCQ1)</title>
+<style>
+  :root { --pad: 14px; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Hiragino Sans", "Yu Gothic", sans-serif;
+    background: #0f1115; color: #e6e6e6; line-height: 1.5;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  header { padding: var(--pad); background: #161a22; border-bottom: 1px solid #2a2f3a; }
+  h1 { font-size: 18px; margin: 0; }
+  main { padding: var(--pad); max-width: 720px; margin: 0 auto; }
+  .wrap { position: relative; width: 100%; background: #000; border-radius: 12px; overflow: hidden; aspect-ratio: 3/4; }
+  video, canvas.preview { width: 100%; height: 100%; object-fit: cover; display: block; }
+  canvas.work { display: none; }
+  button {
+    font-size: 17px; padding: 14px 18px; border-radius: 12px; border: none;
+    background: #3b82f6; color: #fff; font-weight: 600; cursor: pointer;
+    min-height: 52px; width: 100%; margin-top: 10px;
+  }
+  button.secondary { background: #374151; }
+  button:disabled { opacity: .5; }
+  .row { display: flex; gap: 10px; }
+  .row > button { margin-top: 10px; }
+  .bar { height: 14px; background: #1f2530; border-radius: 8px; overflow: hidden; margin: 12px 0 6px; }
+  .bar > i { display: block; height: 100%; width: 0%; background: #22c55e; transition: width .2s; }
+  .status { font-size: 15px; margin: 8px 0; min-height: 22px; }
+  .status.err { color: #f87171; }
+  .status.ok { color: #4ade80; }
+  .status.info { color: #93c5fd; }
+  textarea { width: 100%; min-height: 140px; font-size: 15px; background: #0b0e13; color: #e6e6e6;
+    border: 1px solid #2a2f3a; border-radius: 10px; padding: 12px; }
+  .muted { color: #9aa4b2; font-size: 13px; }
+  .card { background: #161a22; border: 1px solid #2a2f3a; border-radius: 12px; padding: var(--pad); margin-top: 14px; }
+  .hidden { display: none; }
+  code { background: #0b0e13; padding: 1px 5px; border-radius: 5px; }
+</style>
+</head>
+<body>
+<header><h1>QRグリッド受信 (CDCQ1)</h1></header>
+<main>
+  <p class="muted">オフラインPC画面のQRコード群をカメラで連続スキャンし、データを復元します。</p>
+
+  <div class="wrap">
+    <video id="video" playsinline muted></video>
+    <canvas id="work" class="work"></canvas>
+  </div>
+
+  <button id="startBtn">カメラを開始</button>
+  <div class="row">
+    <button id="resetBtn" class="secondary">リセット（新規転送）</button>
+  </div>
+
+  <div class="bar"><i id="barFill"></i></div>
+  <div class="status info" id="progress">未受信</div>
+  <div class="status" id="status"></div>
+
+  <div class="card hidden" id="resultCard">
+    <div id="resultMeta" class="muted"></div>
+    <div id="textResult" class="hidden">
+      <textarea id="textOut" readonly></textarea>
+      <button id="copyBtn">テキストをコピー</button>
+    </div>
+    <div id="fileResult" class="hidden">
+      <button id="downloadBtn">ファイルをダウンロード</button>
+    </div>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+
+<!-- ==== PURE-LOGIC-START (extracted verbatim by qr-reader.test.mjs — keep browser-native APIs only) ==== -->
+<script>
+/*
+ * Pure, side-effect-free decode/reassembly/verify/decompress helpers.
+ * Uses only APIs available in both browsers and modern Node:
+ *   atob, TextDecoder, crypto.subtle, DecompressionStream.
+ * (Browser gunzip = DecompressionStream('gzip'); Node test validates the same
+ *  gzip bytes with zlib.gunzipSync — identical stream, per task note.)
+ */
+
+// Parse one QR text "Q1|<id8>|<idx>|<total>|<chunk>" -> {id8,idx,total,chunk} or null.
+// base64 chunks never contain "|", but we rejoin parts[4:] defensively to mirror Python split("|",4).
+function parseQrText(t) {
+  if (typeof t !== 'string' || !t.startsWith('Q1|')) return null;
+  const p = t.split('|');
+  if (p.length < 5) return null;
+  const idx = parseInt(p[2], 10);
+  const total = parseInt(p[3], 10);
+  if (!Number.isInteger(idx) || !Number.isInteger(total) || total <= 0) return null;
+  return { id8: p[1], idx, total, chunk: p.slice(4).join('|') };
+}
+
+// Concatenate chunks (Map<idx,chunk>) in idx order -> base64 string. Returns null if incomplete.
+function reassembleB64(chunks, total) {
+  if (chunks.size < total) return null;
+  let out = '';
+  for (let i = 0; i < total; i++) {
+    if (!chunks.has(i)) return null;
+    out += chunks.get(i);
+  }
+  return out;
+}
+
+// SHA-256 of the UTF-8 bytes of the base64 STRING; first 8 hex chars.
+async function id8OfB64(b64) {
+  const bytes = new TextEncoder().encode(b64);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const hex = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return hex.slice(0, 8);
+}
+
+// base64 string -> Uint8Array (atob path).
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// Split container at FIRST 0x0A: header (ASCII) + data bytes.
+// Header: "CDCQ1 <T|F> <0|1> <nameB64|-> <origSize>"
+function parseContainer(bytes) {
+  let nl = -1;
+  for (let i = 0; i < bytes.length; i++) { if (bytes[i] === 0x0A) { nl = i; break; } }
+  if (nl < 0) throw new Error('コンテナ改行が見つかりません');
+  const header = new TextDecoder('ascii').decode(bytes.subarray(0, nl));
+  const parts = header.split(' ');
+  if (parts.length !== 5 || parts[0] !== 'CDCQ1') throw new Error('ヘッダ形式が不正: ' + header);
+  const type = parts[1];        // 'T' or 'F'
+  const compressed = parts[2] === '1';
+  const nameB64 = parts[3];     // base64 filename or '-'
+  const origSize = parseInt(parts[4], 10);
+  const data = bytes.subarray(nl + 1);
+  return { type, compressed, nameB64, origSize, data };
+}
+
+// gunzip via browser-native DecompressionStream('gzip'). data: Uint8Array -> Uint8Array.
+async function gunzip(data) {
+  const ds = new DecompressionStream('gzip');
+  const stream = new Response(data).body.pipeThrough(ds);
+  const buf = await new Response(stream).arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+// base64(nameB64) -> UTF-8 filename ('' if '-').
+function decodeName(nameB64) {
+  if (nameB64 === '-') return '';
+  return new TextDecoder('utf-8').decode(b64ToBytes(nameB64));
+}
+
+// Full pipeline from an ARRAY of already-reassembled+verified b64? No —
+// decodeTransfer takes the collected chunk Map and does verify+parse+gunzip.
+// Returns { type, name, data: Uint8Array, text?: string }.
+async function decodeTransfer(id8, chunks, total) {
+  const b64 = reassembleB64(chunks, total);
+  if (b64 === null) throw new Error('チャンク不足');
+  const calc = await id8OfB64(b64);
+  if (calc !== id8) throw new Error('整合性エラー: ハッシュ不一致 (' + calc + ' != ' + id8 + ')');
+  const container = b64ToBytes(b64);
+  const { type, compressed, nameB64, origSize, data } = parseContainer(container);
+  let out = compressed ? await gunzip(data) : data;
+  // ensure a standalone Uint8Array (not a subarray view) for Blob/text use
+  out = out instanceof Uint8Array ? new Uint8Array(out) : new Uint8Array(out);
+  if (out.length !== origSize) throw new Error('サイズ検証エラー: ' + out.length + ' != ' + origSize);
+  const name = decodeName(nameB64);
+  const result = { type, name, data: out };
+  if (type === 'T') result.text = new TextDecoder('utf-8').decode(out);
+  return result;
+}
+</script>
+<!-- ==== PURE-LOGIC-END ==== -->
+
+<script>
+// ---------- UI / camera glue (not unit-tested) ----------
+const video = document.getElementById('video');
+const work = document.getElementById('work');
+const wctx = work.getContext('2d', { willReadFrequently: true });
+const startBtn = document.getElementById('startBtn');
+const resetBtn = document.getElementById('resetBtn');
+const barFill = document.getElementById('barFill');
+const progressEl = document.getElementById('progress');
+const statusEl = document.getElementById('status');
+const resultCard = document.getElementById('resultCard');
+const resultMeta = document.getElementById('resultMeta');
+const textResult = document.getElementById('textResult');
+const textOut = document.getElementById('textOut');
+const fileResult = document.getElementById('fileResult');
+const copyBtn = document.getElementById('copyBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+
+let stream = null, rafId = null, scanning = false;
+let lockedId = null, total = null;
+let chunks = new Map();
+let done = false;
+let lastBlobUrl = null, lastFileName = 'download.bin';
+
+function setStatus(msg, kind) { statusEl.textContent = msg; statusEl.className = 'status' + (kind ? ' ' + kind : ''); }
+function updateProgress() {
+  if (total == null) { progressEl.textContent = '未受信'; barFill.style.width = '0%'; return; }
+  const pct = Math.round((chunks.size / total) * 100);
+  barFill.style.width = pct + '%';
+  progressEl.textContent = `受信 ${chunks.size} / ${total}  (id=${lockedId || '-'})`;
+}
+
+function resetTransfer() {
+  lockedId = null; total = null; chunks = new Map(); done = false;
+  resultCard.classList.add('hidden');
+  textResult.classList.add('hidden'); fileResult.classList.add('hidden');
+  textOut.value = '';
+  if (lastBlobUrl) { URL.revokeObjectURL(lastBlobUrl); lastBlobUrl = null; }
+  setStatus('新しい転送を待機中', 'info');
+  updateProgress();
+}
+
+function ingestText(t) {
+  const q = parseQrText(t);
+  if (!q) return;
+  if (lockedId === null) { lockedId = q.id8; total = q.total; }   // lock onto first id
+  if (q.id8 !== lockedId) return;                                  // ignore other transfers
+  if (chunks.has(q.idx)) return;                                   // dedupe
+  chunks.set(q.idx, q.chunk);
+  updateProgress();
+  if (!done && total != null && chunks.size === total) finish();
+}
+
+async function finish() {
+  done = true;
+  setStatus('全チャンク受信 — 検証中…', 'info');
+  try {
+    const res = await decodeTransfer(lockedId, chunks, total);
+    resultCard.classList.remove('hidden');
+    if (res.type === 'T') {
+      textResult.classList.remove('hidden');
+      textOut.value = res.text;
+      resultMeta.textContent = `テキスト (${res.data.length} バイト)`;
+    } else {
+      fileResult.classList.remove('hidden');
+      lastFileName = res.name || 'download.bin';
+      const blob = new Blob([res.data], { type: 'application/octet-stream' });
+      if (lastBlobUrl) URL.revokeObjectURL(lastBlobUrl);
+      lastBlobUrl = URL.createObjectURL(blob);
+      resultMeta.textContent = `ファイル: ${lastFileName} (${res.data.length} バイト)`;
+    }
+    setStatus('復元成功', 'ok');
+  } catch (e) {
+    done = false; // allow re-scan to recover from a bad frame set
+    setStatus('エラー: ' + e.message, 'err');
+  }
+}
+
+function loop() {
+  if (!scanning) return;
+  if (video.readyState === video.HAVE_ENOUGH_DATA) {
+    const w = video.videoWidth, h = video.videoHeight;
+    if (w && h) {
+      if (work.width !== w) { work.width = w; work.height = h; }
+      wctx.drawImage(video, 0, 0, w, h);
+      const img = wctx.getImageData(0, 0, w, h);
+      const code = (typeof jsQR !== 'undefined') ? jsQR(img.data, w, h, { inversionAttempts: 'dontInvert' }) : null;
+      if (code && code.data) ingestText(code.data);
+    }
+  }
+  rafId = requestAnimationFrame(loop);
+}
+
+async function startCamera() {
+  if (scanning) return;
+  setStatus('カメラを起動中…', 'info');
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    scanning = true;
+    startBtn.textContent = 'スキャン中…';
+    startBtn.disabled = true;
+    setStatus('QRをカメラに向けてください', 'info');
+    loop();
+  } catch (e) {
+    if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError')) {
+      setStatus('カメラの使用が拒否されました。ブラウザ設定でカメラを許可してください。', 'err');
+    } else if (e && e.name === 'NotFoundError') {
+      setStatus('カメラが見つかりません。', 'err');
+    } else {
+      setStatus('カメラ起動エラー: ' + (e && e.message ? e.message : e), 'err');
+    }
+  }
+}
+
+startBtn.addEventListener('click', startCamera);
+resetBtn.addEventListener('click', resetTransfer);
+copyBtn.addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(textOut.value); copyBtn.textContent = 'コピーしました ✓';
+    setTimeout(() => copyBtn.textContent = 'テキストをコピー', 1500); }
+  catch { textOut.select(); document.execCommand('copy'); }
+});
+downloadBtn.addEventListener('click', () => {
+  if (!lastBlobUrl) return;
+  const a = document.createElement('a');
+  a.href = lastBlobUrl; a.download = lastFileName; document.body.appendChild(a); a.click(); a.remove();
+});
+
+resetTransfer();
+</script>
+</body>
+</html>
