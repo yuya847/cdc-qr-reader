@@ -17,6 +17,7 @@
   main { padding: var(--pad); max-width: 720px; margin: 0 auto; }
   .wrap { position: relative; width: 100%; background: #000; border-radius: 12px; overflow: hidden; aspect-ratio: 3/4; }
   video, canvas.preview { width: 100%; height: 100%; object-fit: cover; display: block; }
+  canvas.overlay { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; pointer-events: none; }
   canvas.work { display: none; }
   button {
     font-size: 17px; padding: 14px 18px; border-radius: 12px; border: none;
@@ -39,15 +40,27 @@
   .card { background: #161a22; border: 1px solid #2a2f3a; border-radius: 12px; padding: var(--pad); margin-top: 14px; }
   .hidden { display: none; }
   code { background: #0b0e13; padding: 1px 5px; border-radius: 5px; }
+  /* --- 未読チャンク表示 --- */
+  #missingText { font-size: 15px; margin: 6px 0; color: #fbbf24; min-height: 22px; word-break: break-all; }
+  #missingText.allok { color: #4ade80; }
+  #chipGrid { display: flex; flex-wrap: wrap; gap: 5px; margin: 6px 0 2px; }
+  .chip {
+    width: 38px; height: 30px; border-radius: 7px; font-size: 13px; font-weight: 600;
+    display: flex; align-items: center; justify-content: center;
+    background: #2a2f3a; color: #9aa4b2; border: 1px solid #374151;
+  }
+  .chip.got { background: #14532d; color: #4ade80; border-color: #16a34a; }
+  #engine { font-size: 12px; color: #6b7280; margin-top: 4px; }
 </style>
 </head>
 <body>
 <header><h1>QRグリッド受信 (CDCQ1)</h1></header>
 <main>
-  <p class="muted">オフラインPC画面のQRコード群をカメラで連続スキャンし、データを復元します。</p>
+  <p class="muted">オフラインPC画面のQRコード群をカメラで連続スキャンし、データを復元します。認識したQRは枠で囲まれます(緑=新規取得 / 青=取得済み)。</p>
 
   <div class="wrap">
     <video id="video" playsinline muted></video>
+    <canvas id="overlay" class="overlay"></canvas>
     <canvas id="work" class="work"></canvas>
   </div>
 
@@ -58,7 +71,10 @@
 
   <div class="bar"><i id="barFill"></i></div>
   <div class="status info" id="progress">未受信</div>
+  <div id="missingText"></div>
+  <div id="chipGrid"></div>
   <div class="status" id="status"></div>
+  <div id="engine"></div>
 
   <div class="card hidden" id="resultCard">
     <div id="resultMeta" class="muted"></div>
@@ -179,12 +195,17 @@ async function decodeTransfer(id8, chunks, total) {
 <script>
 // ---------- UI / camera glue (not unit-tested) ----------
 const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const octx = overlay.getContext('2d');
 const work = document.getElementById('work');
 const wctx = work.getContext('2d', { willReadFrequently: true });
 const startBtn = document.getElementById('startBtn');
 const resetBtn = document.getElementById('resetBtn');
 const barFill = document.getElementById('barFill');
 const progressEl = document.getElementById('progress');
+const missingTextEl = document.getElementById('missingText');
+const chipGridEl = document.getElementById('chipGrid');
+const engineEl = document.getElementById('engine');
 const statusEl = document.getElementById('status');
 const resultCard = document.getElementById('resultCard');
 const resultMeta = document.getElementById('resultMeta');
@@ -194,39 +215,197 @@ const fileResult = document.getElementById('fileResult');
 const copyBtn = document.getElementById('copyBtn');
 const downloadBtn = document.getElementById('downloadBtn');
 
-let stream = null, rafId = null, scanning = false;
+let stream = null, rafId = null, scanning = false, detectBusy = false;
 let lockedId = null, total = null;
 let chunks = new Map();
 let done = false;
 let lastBlobUrl = null, lastFileName = 'download.bin';
 
+// 検出枠の履歴 { corners:[{x,y}x4], kind:'new'|'dup'|'other', t:timestamp }
+let recentBoxes = [];
+const BOX_TTL = 600;           // ms: 枠を表示し続ける時間
+const MAX_JSQR_PASSES = 4;     // jsQRフォールバック時の1フレーム最大検出数
+const CHIP_LIMIT = 300;        // チップ表示する最大チャンク数
+
+// ---- マルチQR検出エンジン ----
+// 対応ブラウザ(Android Chrome等)はネイティブBarcodeDetector(1回で複数検出)、
+// 非対応(iOS Safari等)はjsQRで「検出→白塗りマスク→再検出」を繰り返して疑似マルチ検出。
+let barcodeDetector = null;
+async function initDetector() {
+  try {
+    if ('BarcodeDetector' in window) {
+      const fmts = await window.BarcodeDetector.getSupportedFormats();
+      if (fmts.includes('qr_code')) {
+        barcodeDetector = new window.BarcodeDetector({ formats: ['qr_code'] });
+        engineEl.textContent = '検出エンジン: BarcodeDetector (ネイティブ・複数同時対応)';
+        return;
+      }
+    }
+  } catch (e) { /* fall through to jsQR */ }
+  barcodeDetector = null;
+  engineEl.textContent = '検出エンジン: jsQR (マスク反復方式・最大' + MAX_JSQR_PASSES + '枚/フレーム)';
+}
+
+// work canvas上の現フレームからQRを複数検出 -> [{text, corners:[{x,y}x4]}]
+async function detectCodes(w, h) {
+  if (barcodeDetector) {
+    try {
+      const codes = await barcodeDetector.detect(work);
+      return codes.map(c => ({
+        text: c.rawValue,
+        corners: (c.cornerPoints && c.cornerPoints.length === 4)
+          ? c.cornerPoints.map(p => ({ x: p.x, y: p.y }))
+          : rectCorners(c.boundingBox)
+      }));
+    } catch (e) {
+      // ネイティブ検出が失敗した端末はjsQRへ恒久フォールバック
+      barcodeDetector = null;
+      engineEl.textContent = '検出エンジン: jsQR (マスク反復方式)';
+    }
+  }
+  // ---- jsQR: 検出のたびに見つけた領域を白で塗りつぶし、残りを再検出 ----
+  const found = [];
+  if (typeof jsQR === 'undefined') return found;
+  for (let pass = 0; pass < MAX_JSQR_PASSES; pass++) {
+    const img = wctx.getImageData(0, 0, w, h);
+    const code = jsQR(img.data, w, h, { inversionAttempts: 'dontInvert' });
+    if (!code || !code.data) break;
+    const loc = code.location;
+    const corners = [loc.topLeftCorner, loc.topRightCorner, loc.bottomRightCorner, loc.bottomLeftCorner]
+      .map(p => ({ x: p.x, y: p.y }));
+    found.push({ text: code.data, corners });
+    // 検出済み領域を白塗り(少し広めに)して次のQRを探す
+    wctx.save();
+    wctx.fillStyle = '#fff';
+    wctx.beginPath();
+    const cx = corners.reduce((s, p) => s + p.x, 0) / 4;
+    const cy = corners.reduce((s, p) => s + p.y, 0) / 4;
+    const grow = 1.15;
+    const gp = corners.map(p => ({ x: cx + (p.x - cx) * grow, y: cy + (p.y - cy) * grow }));
+    wctx.moveTo(gp[0].x, gp[0].y);
+    for (let i = 1; i < 4; i++) wctx.lineTo(gp[i].x, gp[i].y);
+    wctx.closePath(); wctx.fill();
+    wctx.restore();
+  }
+  return found;
+}
+
+function rectCorners(r) {
+  return [
+    { x: r.x, y: r.y }, { x: r.x + r.width, y: r.y },
+    { x: r.x + r.width, y: r.y + r.height }, { x: r.x, y: r.y + r.height }
+  ];
+}
+
+// ---- オーバーレイ描画 ----
+function drawOverlay() {
+  const w = overlay.width, h = overlay.height;
+  if (!w || !h) return;
+  octx.clearRect(0, 0, w, h);
+  const now = performance.now();
+  recentBoxes = recentBoxes.filter(b => now - b.t < BOX_TTL);
+  for (const b of recentBoxes) {
+    const age = (now - b.t) / BOX_TTL;         // 0(新しい)→1(消える)
+    const alpha = 1 - age * 0.7;
+    let color;
+    if (b.kind === 'new') color = `rgba(34, 197, 94, ${alpha})`;        // 緑: 新規チャンク
+    else if (b.kind === 'dup') color = `rgba(59, 130, 246, ${alpha})`;  // 青: 取得済み
+    else color = `rgba(156, 163, 175, ${alpha})`;                       // 灰: 対象外
+    octx.strokeStyle = color;
+    octx.lineWidth = Math.max(4, w / 160);
+    octx.lineJoin = 'round';
+    octx.beginPath();
+    octx.moveTo(b.corners[0].x, b.corners[0].y);
+    for (let i = 1; i < 4; i++) octx.lineTo(b.corners[i].x, b.corners[i].y);
+    octx.closePath();
+    octx.stroke();
+    // 新規取得したQRには番号ラベルを表示
+    if (b.kind === 'new' && b.label) {
+      const cx = b.corners.reduce((s, p) => s + p.x, 0) / 4;
+      const cy = b.corners.reduce((s, p) => s + p.y, 0) / 4;
+      octx.font = `bold ${Math.max(22, w / 24)}px sans-serif`;
+      octx.textAlign = 'center'; octx.textBaseline = 'middle';
+      octx.fillStyle = `rgba(34, 197, 94, ${alpha})`;
+      octx.fillText(b.label, cx, cy);
+    }
+  }
+}
+
 function setStatus(msg, kind) { statusEl.textContent = msg; statusEl.className = 'status' + (kind ? ' ' + kind : ''); }
+
+// ---- 進捗 & 未読チャンク番号の表示 ----
+function missingIndices() {
+  const miss = [];
+  if (total == null) return miss;
+  for (let i = 0; i < total; i++) if (!chunks.has(i)) miss.push(i);
+  return miss;
+}
+
 function updateProgress() {
-  if (total == null) { progressEl.textContent = '未受信'; barFill.style.width = '0%'; return; }
+  if (total == null) {
+    progressEl.textContent = '未受信'; barFill.style.width = '0%';
+    missingTextEl.textContent = ''; missingTextEl.className = '';
+    chipGridEl.innerHTML = '';
+    return;
+  }
   const pct = Math.round((chunks.size / total) * 100);
   barFill.style.width = pct + '%';
   progressEl.textContent = `受信 ${chunks.size} / ${total}  (id=${lockedId || '-'})`;
+
+  // 未読の「○枚目」(1始まり・PC画面の表示番号と一致)
+  const miss = missingIndices();
+  if (miss.length === 0) {
+    missingTextEl.textContent = '✓ 全' + total + '枚 読み取り完了';
+    missingTextEl.className = 'allok';
+  } else {
+    const nums = miss.map(i => i + 1);
+    const shown = nums.length > 40 ? nums.slice(0, 40).join(', ') + ' …' : nums.join(', ');
+    missingTextEl.textContent = `未読 ${miss.length}枚: ${shown} 枚目`;
+    missingTextEl.className = '';
+  }
+
+  // 番号チップ(緑=受信済み)。多すぎる場合は省略。
+  if (total <= CHIP_LIMIT) {
+    if (chipGridEl.childElementCount !== total) {
+      chipGridEl.innerHTML = '';
+      for (let i = 0; i < total; i++) {
+        const d = document.createElement('div');
+        d.className = 'chip'; d.textContent = i + 1; d.dataset.i = i;
+        chipGridEl.appendChild(d);
+      }
+    }
+    for (const el of chipGridEl.children) {
+      el.classList.toggle('got', chunks.has(parseInt(el.dataset.i, 10)));
+    }
+  } else {
+    chipGridEl.innerHTML = '';
+  }
 }
 
 function resetTransfer() {
   lockedId = null; total = null; chunks = new Map(); done = false;
+  recentBoxes = [];
   resultCard.classList.add('hidden');
   textResult.classList.add('hidden'); fileResult.classList.add('hidden');
   textOut.value = '';
   if (lastBlobUrl) { URL.revokeObjectURL(lastBlobUrl); lastBlobUrl = null; }
   setStatus('新しい転送を待機中', 'info');
   updateProgress();
+  drawOverlay();
 }
 
+// 取り込み結果を返す: 'new' | 'dup' | 'other' | 'invalid'
 function ingestText(t) {
   const q = parseQrText(t);
-  if (!q) return;
+  if (!q) return { kind: 'other' };
   if (lockedId === null) { lockedId = q.id8; total = q.total; }   // lock onto first id
-  if (q.id8 !== lockedId) return;                                  // ignore other transfers
-  if (chunks.has(q.idx)) return;                                   // dedupe
+  if (q.id8 !== lockedId) return { kind: 'other' };                // ignore other transfers
+  if (chunks.has(q.idx)) return { kind: 'dup' };                   // dedupe
   chunks.set(q.idx, q.chunk);
   updateProgress();
+  if (navigator.vibrate) { try { navigator.vibrate(25); } catch (e) {} }
   if (!done && total != null && chunks.size === total) finish();
+  return { kind: 'new', label: String(q.idx + 1) };
 }
 
 async function finish() {
@@ -248,23 +427,33 @@ async function finish() {
       resultMeta.textContent = `ファイル: ${lastFileName} (${res.data.length} バイト)`;
     }
     setStatus('復元成功', 'ok');
+    if (navigator.vibrate) { try { navigator.vibrate([60, 40, 60]); } catch (e) {} }
   } catch (e) {
     done = false; // allow re-scan to recover from a bad frame set
     setStatus('エラー: ' + e.message, 'err');
   }
 }
 
+async function processFrame() {
+  const w = video.videoWidth, h = video.videoHeight;
+  if (!w || !h) return;
+  if (work.width !== w) { work.width = w; work.height = h; }
+  if (overlay.width !== w) { overlay.width = w; overlay.height = h; }
+  wctx.drawImage(video, 0, 0, w, h);
+  const codes = await detectCodes(w, h);   // ★複数QRを一度に検出
+  const now = performance.now();
+  for (const c of codes) {
+    const r = ingestText(c.text);
+    recentBoxes.push({ corners: c.corners, kind: r.kind, label: r.label, t: now });
+  }
+}
+
 function loop() {
   if (!scanning) return;
-  if (video.readyState === video.HAVE_ENOUGH_DATA) {
-    const w = video.videoWidth, h = video.videoHeight;
-    if (w && h) {
-      if (work.width !== w) { work.width = w; work.height = h; }
-      wctx.drawImage(video, 0, 0, w, h);
-      const img = wctx.getImageData(0, 0, w, h);
-      const code = (typeof jsQR !== 'undefined') ? jsQR(img.data, w, h, { inversionAttempts: 'dontInvert' }) : null;
-      if (code && code.data) ingestText(code.data);
-    }
+  drawOverlay();  // 枠は毎フレーム描画(フェードアウト)
+  if (!detectBusy && video.readyState === video.HAVE_ENOUGH_DATA) {
+    detectBusy = true;
+    processFrame().catch(() => {}).finally(() => { detectBusy = false; });
   }
   rafId = requestAnimationFrame(loop);
 }
@@ -273,7 +462,10 @@ async function startCamera() {
   if (scanning) return;
   setStatus('カメラを起動中…', 'info');
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false
+    });
     video.srcObject = stream;
     await video.play();
     scanning = true;
@@ -305,6 +497,7 @@ downloadBtn.addEventListener('click', () => {
   a.href = lastBlobUrl; a.download = lastFileName; document.body.appendChild(a); a.click(); a.remove();
 });
 
+initDetector();
 resetTransfer();
 </script>
 </body>
